@@ -1,6 +1,6 @@
-# Gamdl Desktop Fork 1.1.4
+# Gamdl Desktop Fork 1.1.5
 
-[![Release](https://img.shields.io/badge/release-1.1.4-0a84ff)](https://github.com/Mrgu2/gu_music_downloader/releases)
+[![Release](https://img.shields.io/badge/release-1.1.5-0a84ff)](https://github.com/Mrgu2/gu_music_downloader/releases)
 [![License](https://img.shields.io/github/license/Mrgu2/gu_music_downloader)](https://github.com/Mrgu2/gu_music_downloader/blob/codex/alac-download/LICENSE)
 
 <p align="center">
@@ -13,7 +13,7 @@
 
 ## 项目定位
 
-`Gamdl Desktop Fork 1.1.4` 的目标很明确：
+`Gamdl Desktop Fork 1.1.5` 的目标很明确：
 
 - 提供开箱即用的桌面客户端，而不是只给命令行
 - 默认覆盖最常用场景：歌曲、专辑、歌单、艺术家下载
@@ -26,9 +26,9 @@
 - 当前修改分支：[codex/alac-download](https://github.com/Mrgu2/gu_music_downloader/tree/codex/alac-download)
 - 上游项目：[glomatico/gamdl](https://github.com/glomatico/gamdl)
 
-## 1.1.4 发布内容
+## 1.1.5 发布内容
 
-正式版 `1.1.4` 这次继续发布 macOS 桌面包，并同时覆盖 Apple Silicon 与 Intel 机型：
+正式版 `1.1.5` 这次继续发布 macOS 桌面包，并同时覆盖 Apple Silicon 与 Intel 机型：
 
 - `Apple Music Downloader-arm64.dmg`
   - 面向 Apple Silicon Mac
@@ -39,18 +39,14 @@
 
 源码仓库仍然保留 CLI、Windows 启动器和开发环境，适合高级用户自行构建或二次修改。
 
-本次版本主要覆盖 Apple Music 网页与 API 更新后的兼容性、下载解密内存优化，以及本地桌面端安全审查收口，并继续沿用之前 release 的分发方式：
+本次版本主要修复部分 ALAC 歌曲下载时只报出内部音轨标识的问题，并补齐回归测试与双架构打包验证：
 
-- 修复 Apple Music 网页更新后登录校验失败的问题；开发者 token 解析现在会从当前 `assets/index~...js` 和 legacy 入口中识别有效 JWT
-- 移植 Apple Music API 兼容性修复，覆盖分页、library media、library song / music-video URL 以及单曲 m3u8 master URL fallback
-- 支持 DRM-free library song 直接下载，避免无解密 key 时被误判为格式不可用
-- 下载核心补强：yt-dlp 下载现在按流类型直接使用 HlsFD / HttpFD，song 解密会传递 CENC 与 single content key 标记
-- 进一步降低 song 解密峰值内存；file-backed 解密模式会把解密后的 payload 写入临时文件，并从临时文件流式写入最终 `mdat`
-- 依赖安全升级：重锁 `urllib3`、`cryptography` 与 `idna` 到包含最新安全修复的版本
-- 本地 Web API、诊断包导出、配置 / 会话文件权限、下载路径组件、歌词 XML 解析和桌面文件打开链路都完成一轮安全硬化
-- 新增 `docs/security-audit-2026-06-12.md`，记录本轮安全审查范围、修复项、验证命令和剩余低风险判断
-- 本次不附带 Windows 现成安装包；如需 Windows，请自行用 agent 修改并编译
-- 如果你要在 Windows 上继续推进，推荐直接使用 Claude Code 或 Codex
+- 当播放列表音轨标识与资产元数据不一致时，按所选音频组匹配，修复 `'dktu2l6sm'` 等报错
+- 补齐音轨标识缺失、元数据缺失和匹配不唯一时的处理，避免崩溃或任意使用其他音轨的元数据
+- macOS 构建保留旧产物、强制装入当前源码，并修正系统显示的应用版本号
+- 两个架构的正式应用均完成 ALAC 实际下载与完整解码验证
+- 当前 release 不附带 Windows 现成安装包
+- 详细更新及验证说明见 [1.1.5 发布说明](docs/release-1.1.5.md)
 
 ## 主要功能
 
@@ -110,7 +106,7 @@ macOS 包说明：
 
 ### Windows
 
-当前 `1.1.4` release 不附带 Windows 安装包。
+当前 `1.1.5` release 不附带 Windows 安装包。
 
 Windows 包说明：
 
@@ -168,6 +164,8 @@ MACOS_ARCH=x86_64 bash scripts/build-macos-app.sh
 - 脚本会为 `arm64` 和 `x86_64` 分别创建独立构建环境，默认目录分别是 `.venv-macos-arm64` 和 `.venv-macos-x86_64`
 - `x86_64` 构建不会复用当前的 arm64 `.venv`
 - 如果没有提供兼容目标架构的 `ffmpeg`，脚本会直接报错
+- 构建会强制重装当前项目，确保同版本下的源码修复进入安装包
+- 如默认输出目录已有应用或 DMG，脚本会保留文件并退出；再次构建请设置新的 `MACOS_DIST_DIR`，也可通过 `MACOS_BUILD_DIR` 指定工作目录
 
 构建产物：
 

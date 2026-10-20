@@ -329,8 +329,34 @@ class AppleMusicSongInterface(AppleMusicInterface):
 
         if session_key_metadata:
             asset_metadata = self._get_asset_metadata(m3u8_master_data)
-            variant_id = playlist["stream_info"]["stable_variant_id"]
-            drm_ids = asset_metadata[variant_id]["AUDIO-SESSION-KEY-IDS"]
+            variant_id = playlist["stream_info"].get("stable_variant_id")
+            audio_group = playlist["stream_info"].get("audio")
+            asset = asset_metadata.get(variant_id) if asset_metadata else None
+            if asset is None and asset_metadata and audio_group:
+                # Apple may index assets separately from STABLE-VARIANT-ID.
+                # Only use an unambiguous match for the selected audio group.
+                matching_assets = [
+                    candidate
+                    for candidate in asset_metadata.values()
+                    if candidate.get("GROUP-ID") == audio_group
+                ]
+                if len(matching_assets) == 1:
+                    asset = matching_assets[0]
+            if asset is None:
+                logger.warning(
+                    "No unique audio asset metadata for variant %s (audio=%s)",
+                    variant_id,
+                    audio_group,
+                )
+                return None
+            drm_ids = asset.get("AUDIO-SESSION-KEY-IDS")
+            if not drm_ids:
+                logger.warning(
+                    "No audio session key IDs for variant %s (audio=%s)",
+                    variant_id,
+                    audio_group,
+                )
+                return None
 
             stream_info.widevine_pssh = self._get_drm_uri_from_session_key(
                 session_key_metadata,

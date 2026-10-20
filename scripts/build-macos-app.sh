@@ -2,13 +2,13 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-DIST_DIR="$ROOT_DIR/dist"
-BUILD_DIR="$ROOT_DIR/build"
 APP_NAME="Apple Music Downloader"
 ICON_PATH="$ROOT_DIR/assets/macos/app-icon.icns"
 DMG_NOTE_NAME="IMPORTANT - First Launch ／ 首次启动说明.txt"
 HOST_ARCH="$(uname -m)"
 MACOS_ARCH="${MACOS_ARCH:-$HOST_ARCH}"
+DIST_DIR="${MACOS_DIST_DIR:-$ROOT_DIR/dist}"
+BUILD_DIR="${MACOS_BUILD_DIR:-$ROOT_DIR/build/macos-$MACOS_ARCH}"
 MACOS_BUILD_PYTHON="${MACOS_BUILD_PYTHON:-/Library/Frameworks/Python.framework/Versions/3.10/bin/python3}"
 MACOS_VENV_DIR="${MACOS_VENV_DIR:-$ROOT_DIR/.venv-macos-$MACOS_ARCH}"
 APP_PATH="$DIST_DIR/$APP_NAME.app"
@@ -98,7 +98,11 @@ resolve_ffmpeg_source() {
 }
 
 cd "$ROOT_DIR"
-rm -rf "$BUILD_DIR" "$APP_PATH" "$DMG_PATH"
+APP_VERSION="$("$MACOS_BUILD_PYTHON" -c 'from gamdl import __version__; print(__version__)')"
+if [[ -e "$APP_PATH" || -e "$DMG_PATH" || -e "$DIST_DIR/$APP_NAME" ]]; then
+  echo "Build output already exists. Set MACOS_DIST_DIR to a new directory to preserve existing files."
+  exit 1
+fi
 mkdir -p "$DIST_DIR" "$BUILD_DIR"
 export PYINSTALLER_CONFIG_DIR="${PYINSTALLER_CONFIG_DIR:-$BUILD_DIR/pyinstaller-cache}"
 mkdir -p "$PYINSTALLER_CONFIG_DIR"
@@ -113,6 +117,7 @@ UV_PROJECT_ENVIRONMENT="$MACOS_VENV_DIR" uv sync \
   --extra desktop-build \
   --locked \
   --no-editable \
+  --reinstall-package gamdl \
   --python "$MACOS_BUILD_PYTHON" \
   --python-platform "$UV_PYTHON_PLATFORM"
 
@@ -140,10 +145,10 @@ PYINSTALLER_ARGS=(
   --hidden-import AppKit
   --hidden-import WebKit
   --target-arch "$MACOS_ARCH"
+  --distpath "$DIST_DIR"
+  --workpath "$BUILD_DIR/pyinstaller-work"
   --add-data "$ROOT_DIR/README.md:."
 )
-
-chmod +x "$FFMPEG_SOURCE"
 
 run_for_target_arch "$MACOS_VENV_DIR/bin/python" -m PyInstaller \
   --specpath "$BUILD_DIR" \
@@ -151,6 +156,18 @@ run_for_target_arch "$MACOS_VENV_DIR/bin/python" -m PyInstaller \
   gamdl/desktop_app.py
 
 require_binary_arch "$APP_PATH/Contents/MacOS/$APP_NAME" "$MACOS_ARCH"
+# Set bundle metadata before bundle_ffmpeg performs the final ad hoc signing.
+"$MACOS_VENV_DIR/bin/python" - "$APP_PATH" "$APP_VERSION" <<'PY'
+from pathlib import Path
+import plistlib
+import sys
+
+plist_path = Path(sys.argv[1]) / "Contents" / "Info.plist"
+payload = plistlib.loads(plist_path.read_bytes())
+payload["CFBundleShortVersionString"] = sys.argv[2]
+payload["CFBundleVersion"] = sys.argv[2]
+plist_path.write_bytes(plistlib.dumps(payload))
+PY
 "$MACOS_VENV_DIR/bin/python" "$ROOT_DIR/scripts/bundle_macos_ffmpeg.py" "$APP_PATH" "$FFMPEG_SOURCE"
 require_binary_arch "$APP_PATH/Contents/Frameworks/bin/ffmpeg" "$MACOS_ARCH"
 

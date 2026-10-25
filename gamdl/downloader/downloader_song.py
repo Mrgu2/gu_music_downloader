@@ -181,6 +181,7 @@ class AppleMusicSongDownloader(AppleMusicBaseDownloader):
                 download_item.final_path,
                 cover_file_extension,
                 download_item.source_context,
+                album=download_item.media_tags.album,
             )
 
         return download_item
@@ -259,10 +260,10 @@ class AppleMusicSongDownloader(AppleMusicBaseDownloader):
         final_path: str,
         file_extension: str,
         source_context: str | None = None,
+        album: str | None = None,
     ) -> str:
-        if source_context == "artist-top-songs":
-            return str(Path(final_path).with_suffix(file_extension))
-        return str(Path(final_path).parent / ("Cover" + file_extension))
+        filename = self.sanitize_string("cover-" + (album or "Unknown Album"), file_ext=file_extension)
+        return str(Path(final_path).parent / filename)
 
     def write_synced_lyrics(
         self,

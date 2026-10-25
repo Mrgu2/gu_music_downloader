@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import time
 from dataclasses import asdict, dataclass, field
@@ -28,6 +29,8 @@ from ..downloader.constants import (
 )
 from .paths import AppPaths
 from .cancellation import JobCancelledError
+from .conversion import ConversionJobSpec, ConversionService
+from .settings import validate_concurrency
 from .wrapper_manager import WrapperManager
 
 logger = logging.getLogger("gamdl.app.download")
@@ -49,6 +52,11 @@ class DownloadJob:
     output_path: str
     overwrite: bool = False
     save_cover: bool = True
+    download_output_format: str = "original"
+    keep_original_files: bool = False
+    download_concurrency: int = 8
+    conversion_concurrency: int = 8
+    preserve_folder_structure: bool = True
     log_level: str = "INFO"
     save_playlist: bool = False
     language: str = "zh-CN"
@@ -68,6 +76,20 @@ class DownloadResult:
     downloaded_items: int = 0
     skipped_items: int = 0
     errors: int = 0
+    active_downloads: int = 0
+    download_concurrency: int = 8
+    total_items: int = 0
+    preparation_total: int = 0
+    prepared_items: int = 0
+    converted_items: int = 0
+    conversion_skipped: int = 0
+    conversion_errors: int = 0
+    conversion_total: int = 0
+    active_conversions: int = 0
+    conversion_concurrency: int = 8
+    download_output_format: str = "original"
+    downloading_titles: list[str] = field(default_factory=list)
+    converting_titles: list[str] = field(default_factory=list)
     output_path: str | None = None
     latest_media_path: str | None = None
     latest_media_dir: str | None = None
@@ -85,13 +107,20 @@ class DownloadService:
         log_callback: Callable[[str], None] | None = None,
         cancel_callback: Callable[[], bool] | None = None,
         paths: AppPaths | None = None,
+        progress_callback: Callable[[dict], None] | None = None,
     ) -> None:
         self.media_user_token = media_user_token
         self.log_callback = log_callback
         self.cancel_callback = cancel_callback
+        self.progress_callback = progress_callback
         self.paths = paths or AppPaths()
         self.paths.ensure()
         self.wrapper_manager = WrapperManager()
+        self._conversion_queue: asyncio.Queue | None = None
+        self._conversion_destinations: set[str] = set()
+        self._download_output_format = "original"
+        self._overwrite = False
+        self._keep_original_files = False
 
     @staticmethod
     def _network_config(job: DownloadJob) -> NetworkConfig:
@@ -101,6 +130,10 @@ class DownloadService:
         logger.info(message)
         if self.log_callback:
             self.log_callback(message)
+
+    def _publish_progress(self, result: DownloadResult) -> None:
+        if self.progress_callback:
+            self.progress_callback(result.to_dict())
 
     def _check_cancel(self, result: DownloadResult) -> None:
         if not self.cancel_callback or not self.cancel_callback():
@@ -166,6 +199,7 @@ class DownloadService:
                 temp_path=str(self.paths.temp_dir),
                 overwrite=job.overwrite,
                 save_cover=job.save_cover,
+                preserve_folder_structure=job.preserve_folder_structure,
                 save_playlist=job.save_playlist,
                 use_wrapper=job.use_wrapper,
                 wrapper_decrypt_ip=job.wrapper_decrypt_ip,
@@ -198,10 +232,121 @@ class DownloadService:
             raise ValueError(f"首版仅支持歌曲、专辑、歌单和艺术家，暂不支持 {kind or '该链接'}。")
 
     async def run(self, job: DownloadJob) -> DownloadResult:
+        if job.download_output_format not in {"original", "flac", "mp3"}:
+            raise ValueError("下载后格式无效。")
+        self._download_output_format = job.download_output_format
+        self._overwrite = job.overwrite
+        self._keep_original_files = job.keep_original_files
+        validate_concurrency(job.download_concurrency)
+        validate_concurrency(job.conversion_concurrency)
+        self._conversion_destinations = set()
+        result = DownloadResult(download_output_format=job.download_output_format,
+                                download_concurrency=job.download_concurrency,
+                                conversion_concurrency=job.conversion_concurrency)
+        if job.download_output_format == "original":
+            return await self._run_downloads(job, result)
+
+        converter = ConversionService(log_callback=self._emit, cancel_callback=self.cancel_callback,
+                                      concurrency=job.conversion_concurrency)
+        if not converter.full_ffmpeg_path:
+            raise RuntimeError("下载后转换需要 FFmpeg，当前找不到可用的 FFmpeg。")
+        self._conversion_queue = asyncio.Queue(maxsize=2 * job.conversion_concurrency)
+        executor = ThreadPoolExecutor(max_workers=job.conversion_concurrency, thread_name_prefix="download-conversion")
+        workers = [asyncio.create_task(self._conversion_worker(converter, executor, result)) for _ in range(job.conversion_concurrency)]
+        cancelled = False
+        try:
+            try:
+                await self._run_downloads(job, result)
+            except JobCancelledError:
+                cancelled = True
+            await self._conversion_queue.join()
+        finally:
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            executor.shutdown(wait=True)
+            self._conversion_queue = None
+        result.finished_at = time.time()
+        if cancelled or (self.cancel_callback and self.cancel_callback()):
+            raise JobCancelledError(result.to_dict())
+        self._emit(f"任务完成: 下载 {result.downloaded_items}，转换 {result.converted_items}，"
+                   f"转换跳过 {result.conversion_skipped}，错误 {result.errors}")
+        self._publish_progress(result)
+        return result
+
+    async def _enqueue_conversion(self, item, result, source_url, source_kind, source_existed):
+        if self._conversion_queue is None or not item.final_path:
+            return
+        key = str(Path(item.final_path).resolve()).casefold()
+        if key in self._conversion_destinations:
+            return
+        self._conversion_destinations.add(key)
+        result.conversion_total += 1
+        self._publish_progress(result)
+        await self._conversion_queue.put((item, source_url, source_kind, source_existed))
+
+    async def _conversion_worker(self, converter, executor, result):
+        loop = asyncio.get_running_loop()
+        while True:
+            item, source_url, source_kind, source_existed = await self._conversion_queue.get()
+            title = _media_title(item)
+            active = False
+            try:
+                if self.cancel_callback and self.cancel_callback():
+                    continue
+                active = True
+                result.active_conversions += 1
+                result.converting_titles.append(title)
+                self._publish_progress(result)
+                source = Path(item.final_path)
+                destination = source.with_suffix("." + self._download_output_format)
+                self._emit(f'[Convert] 开始 "{title}" -> {self._download_output_format.upper()}')
+                converted = await loop.run_in_executor(
+                    executor, converter.run,
+                    ConversionJobSpec("file", str(source), str(source.parent),
+                                      self._download_output_format, self._overwrite),
+                )
+                if converted.errors:
+                    raise RuntimeError("转换失败，下载原文件已保留；详见上方转换日志。")
+                result.converted_items += converted.converted_files
+                result.conversion_skipped += converted.skipped_files
+                # Update the playlist only after the selected output exists.
+                if destination.exists():
+                    if (item.playlist_tags and item.playlist_file_path
+                            and getattr(self._pipeline_downloader.base_downloader, "save_playlist", False)):
+                        self._pipeline_downloader.base_downloader.update_playlist_file(
+                            item.playlist_file_path, str(destination), item.playlist_tags.playlist_track,
+                        )
+                    if (converted.converted_files and not self._keep_original_files
+                            and not source_existed and source != destination):
+                        source.unlink(missing_ok=True)
+                    result.latest_media_path = str(destination.resolve())
+                    result.latest_media_dir = str(destination.resolve().parent)
+                self._emit(f'[Convert] 完成 "{title}" -> {destination.name}')
+            except JobCancelledError:
+                pass
+            except Exception as exc:
+                result.errors += 1
+                result.conversion_errors += 1
+                result.failed_items.append(_build_failed_item_entry(
+                    item, source_url=source_url, source_kind=source_kind, error=exc,
+                ))
+                self._emit(f'[Convert] 失败 "{title}": {exc}')
+            finally:
+                if active:
+                    result.converting_titles.remove(title)
+                    result.active_conversions -= 1
+                self._publish_progress(result)
+                self._conversion_queue.task_done()
+
+    async def _run_downloads(self, job: DownloadJob, result: DownloadResult) -> DownloadResult:
         total_inputs = len(job.retry_items) if job.retry_items else len(job.urls)
-        result = DownloadResult(total_urls=total_inputs, output_path=job.output_path)
+        result.total_urls = total_inputs
+        result.output_path = job.output_path
+        self._publish_progress(result)
         self._check_cancel(result)
         downloader = await self._create_downloader(job)
+        self._pipeline_downloader = downloader
         try:
             self._emit(
                 f"已连接 Apple Music storefront: {downloader.interface.apple_music_api.storefront}"
@@ -211,8 +356,8 @@ class DownloadService:
                 await self._run_retry_items(job, downloader, result)
                 result.finished_at = time.time()
                 self._emit(
-                    "任务完成: "
-                    f"成功 {result.downloaded_items}，跳过 {result.skipped_items}，错误 {result.errors}"
+                    ("下载阶段完成: " if self._conversion_queue is not None else "任务完成: ")
+                    + f"成功 {result.downloaded_items}，跳过 {result.skipped_items}，错误 {result.errors}"
                 )
                 return result
 
@@ -222,8 +367,8 @@ class DownloadService:
 
             result.finished_at = time.time()
             self._emit(
-                "任务完成: "
-                f"成功 {result.downloaded_items}，跳过 {result.skipped_items}，错误 {result.errors}"
+                ("下载阶段完成: " if self._conversion_queue is not None else "任务完成: ")
+                + f"成功 {result.downloaded_items}，跳过 {result.skipped_items}，错误 {result.errors}"
             )
             return result
         finally:
@@ -305,11 +450,16 @@ class DownloadService:
         try:
             url_info = downloader.get_url_info(url)
             self._validate_url_kind(url_info)
+            if callable(getattr(downloader, "iter_prepared_download_items", None)):
+                await self._process_streaming_url(downloader, result, url, url_info, prefix)
+                return
             download_queue = await downloader.get_download_queue(url_info)
             if not download_queue:
                 self._emit(f'{prefix} 没有可下载内容，已跳过。')
                 result.skipped_items += 1
                 return
+        except JobCancelledError:
+            raise
         except Exception as exc:
             result.errors += 1
             result.failed_items.append(_build_failed_url_entry(url_info, url, exc))
@@ -317,17 +467,116 @@ class DownloadService:
             return
 
         result.processed_urls += 1
-        for item_index, download_item in enumerate(download_queue, 1):
-            self._check_cancel(result)
-            item_prefix = f"[Track {item_index}/{len(download_queue)}]"
-            await self._process_download_item(
-                downloader,
-                result,
-                download_item,
-                item_prefix,
-                source_url=url,
-                source_kind=_url_info_kind(url_info),
-            )
+        result.total_items += len(download_queue)
+        result.preparation_total += len(download_queue)
+        result.prepared_items += len(download_queue)
+        self._publish_progress(result)
+        self._emit(f"歌曲下载并发数: {result.download_concurrency}")
+        pending_items = iter(enumerate(download_queue, 1))
+        destination_locks: dict[str, asyncio.Lock] = {}
+
+        async def worker() -> None:
+            for item_index, download_item in pending_items:
+                if self.cancel_callback and self.cancel_callback():
+                    return
+                # Repeated destinations must not overwrite a file while another
+                # worker is still downloading/tagging it. Temp files use UUIDs.
+                destination = getattr(download_item, "final_path", None)
+                key = str(Path(destination).resolve()).casefold() if destination else str(item_index)
+                lock = destination_locks.setdefault(key, asyncio.Lock())
+                async with lock:
+                    if self.cancel_callback and self.cancel_callback():
+                        return
+                    await self._process_download_item(
+                        downloader, result, download_item,
+                        f"[Track {item_index}/{len(download_queue)}]",
+                        source_url=url, source_kind=_url_info_kind(url_info),
+                    )
+
+        workers = [asyncio.create_task(worker()) for _ in range(min(result.download_concurrency, len(download_queue)))]
+        try:
+            await asyncio.gather(*workers)
+        finally:
+            for task in workers:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+        self._check_cancel(result)
+
+    async def _process_streaming_url(
+        self, downloader: AppleMusicDownloader, result: DownloadResult,
+        url: str, url_info: Any, prefix: str,
+    ) -> None:
+        ready = asyncio.Queue(maxsize=2 * result.download_concurrency)
+        destination_locks: dict[str, asyncio.Lock] = {}
+        self._emit(f"{prefix} 正在读取歌曲列表；歌曲信息就绪后立即下载。")
+
+        async def prepare():
+            cancelled = False
+            stream = downloader.iter_prepared_download_items(url_info, cancel_callback=self.cancel_callback)
+            try:
+                async for item_index, total, item in stream:
+                    if self.cancel_callback and self.cancel_callback():
+                        break
+                    if item_index == 0:
+                        result.processed_urls += 1
+                        result.total_items += total
+                        result.preparation_total += total
+                        self._emit(f"{prefix} 共 {total} 首，开始并发准备并下载。")
+                        self._publish_progress(result)
+                        if not total:
+                            result.skipped_items += 1
+                        continue
+                    result.prepared_items += 1
+                    title = _media_title(item)
+                    if item.error:
+                        self._emit(f'[Prepare {item_index}/{total}] 准备失败 "{title}": {item.error}')
+                    else:
+                        self._emit(f'[Prepare {item_index}/{total}] 信息已就绪 "{title}"')
+                    self._publish_progress(result)
+                    await ready.put((item_index, total, item))
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            except Exception as exc:
+                result.errors += 1
+                result.failed_items.append(_build_failed_url_entry(url_info, url, exc))
+                self._emit(f"{prefix} 读取歌曲信息失败: {exc}")
+                self._publish_progress(result)
+            finally:
+                await stream.aclose()
+                if not cancelled:
+                    for _ in range(result.download_concurrency):
+                        await ready.put(None)
+
+        async def download():
+            while True:
+                value = await ready.get()
+                if value is None:
+                    return
+                item_index, total, item = value
+                if self.cancel_callback and self.cancel_callback():
+                    continue
+                destination = getattr(item, "final_path", None)
+                key = str(Path(destination).resolve()).casefold() if destination else str(item_index)
+                lock = destination_locks.setdefault(key, asyncio.Lock())
+                async with lock:
+                    if self.cancel_callback and self.cancel_callback():
+                        continue
+                    await self._process_download_item(downloader, result, item,
+                        f"[Track {item_index}/{total}]", source_url=url,
+                        source_kind=_url_info_kind(url_info))
+
+        tasks = [asyncio.create_task(prepare())]
+        tasks.extend(asyncio.create_task(download()) for _ in range(result.download_concurrency))
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._check_cancel(result)
 
     async def _process_playlist_retry_item(
         self,
@@ -458,6 +707,10 @@ class DownloadService:
     ) -> None:
         self._check_cancel(result)
         title = _media_title(download_item)
+        result.active_downloads += 1
+        result.downloading_titles.append(title)
+        self._publish_progress(result)
+        source_existed = bool(download_item.final_path and Path(download_item.final_path).exists())
         try:
             if download_item.error:
                 raise download_item.error
@@ -466,9 +719,20 @@ class DownloadService:
                 PLAYLIST_MEDIA_TYPE,
             ):
                 raise ValueError("当前媒体类型未开放到桌面版。")
+            if self._conversion_queue is not None and download_item.final_path:
+                target = Path(download_item.final_path).with_suffix("." + self._download_output_format)
+                if target.exists() and not self._overwrite:
+                    result.skipped_items += 1
+                    result.conversion_total += 1
+                    result.conversion_skipped += 1
+                    result.latest_media_path = str(target.resolve())
+                    result.latest_media_dir = str(target.resolve().parent)
+                    self._emit(f'{item_prefix} 跳过 "{title}": {target.suffix} 目标文件已存在')
+                    return
             self._emit(f'{item_prefix} 下载 "{title}"')
             await downloader.download(download_item)
             result.downloaded_items += 1
+            self._emit(f'{item_prefix} 完成 "{title}"')
             self._consume_sidecar_failures(
                 result,
                 download_item,
@@ -480,6 +744,7 @@ class DownloadService:
                 latest_media_path = str(Path(download_item.final_path).resolve())
                 result.latest_media_path = latest_media_path
                 result.latest_media_dir = str(Path(latest_media_path).parent)
+            await self._enqueue_conversion(download_item, result, source_url, source_kind, source_existed)
         except GamdlError as exc:
             self._consume_sidecar_failures(
                 result,
@@ -490,6 +755,8 @@ class DownloadService:
             )
             result.skipped_items += 1
             self._emit(f'{item_prefix} 跳过 "{title}": {exc}')
+            if download_item.final_path and Path(download_item.final_path).exists():
+                await self._enqueue_conversion(download_item, result, source_url, source_kind, True)
         except Exception as exc:
             result.errors += 1
             result.failed_items.append(
@@ -501,6 +768,10 @@ class DownloadService:
                 )
             )
             self._emit(f'{item_prefix} 下载失败 "{title}": {exc}')
+        finally:
+            result.active_downloads -= 1
+            result.downloading_titles.remove(title)
+            self._publish_progress(result)
 
     def _consume_sidecar_failures(
         self,

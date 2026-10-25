@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from io import BytesIO
 import logging
 from pathlib import Path
 import subprocess
+import tempfile
+import threading
 import time
 from typing import Callable
 
@@ -20,6 +23,7 @@ from mutagen.oggvorbis import OggVorbis
 from PIL import Image
 
 from .cancellation import JobCancelledError
+from .settings import validate_concurrency
 from .executables import resolve_executable
 
 logger = logging.getLogger("gamdl.app.conversion")
@@ -67,6 +71,8 @@ class ConversionResult:
     converted_files: int = 0
     skipped_files: int = 0
     errors: int = 0
+    active_conversions: int = 0
+    conversion_concurrency: int = 8
     latest_media_path: str | None = None
     latest_media_dir: str | None = None
     finished_at: float = field(default_factory=time.time)
@@ -108,12 +114,21 @@ class ConversionService:
         ffmpeg_path: str = "ffmpeg",
         log_callback: Callable[[str], None] | None = None,
         cancel_callback: Callable[[], bool] | None = None,
+        progress_callback: Callable[[dict], None] | None = None,
+        concurrency: int = 8,
     ) -> None:
+        self.concurrency = validate_concurrency(concurrency)
         self.ffmpeg_path = ffmpeg_path
         self.ffmpeg_resolution = resolve_executable("ffmpeg", ffmpeg_path)
         self.full_ffmpeg_path = self.ffmpeg_resolution.path
         self.log_callback = log_callback
         self.cancel_callback = cancel_callback
+        self.progress_callback = progress_callback
+        self._result_lock = threading.RLock()
+
+    def _publish_progress(self, result: ConversionResult) -> None:
+        if self.progress_callback:
+            self.progress_callback(result.to_dict())
 
     def _emit(self, message: str) -> None:
         logger.info(message)
@@ -142,7 +157,8 @@ class ConversionService:
         output_root = Path(job.output_path).expanduser()
         output_root.mkdir(parents=True, exist_ok=True)
 
-        result = ConversionResult()
+        result = ConversionResult(conversion_concurrency=self.concurrency)
+        self._publish_progress(result)
         target_format = ConversionFormat(job.target_format)
         self._check_cancel(result)
 
@@ -174,7 +190,13 @@ class ConversionService:
             result.errors = 1
             raise ValueError("当前仅支持转换常见音频文件。")
         destination = output_root / source_path.with_suffix(f".{target_format.value}").name
-        self._convert_path(source_path, destination, target_format, overwrite, result)
+        result.active_conversions = 1
+        self._publish_progress(result)
+        try:
+            self._convert_path(source_path, destination, target_format, overwrite, result)
+        finally:
+            result.active_conversions = 0
+            self._publish_progress(result)
 
     def _process_directory_mode(
         self,
@@ -187,20 +209,55 @@ class ConversionService:
         if not input_root.is_dir():
             raise ValueError("目录模式下请输入有效的输入目录。")
 
-        discovered_files = sorted(path for path in input_root.rglob("*") if path.is_file())
+        discovered_files = sorted(
+            path for path in input_root.rglob("*")
+            if path.is_file() and not path.name.startswith(".amd-convert-")
+        )
         if not discovered_files:
             raise ValueError("输入目录中没有可处理的文件。")
 
+        groups: dict[Path, list[Path]] = {}
+        result.total_files = len(discovered_files)
         for source_path in discovered_files:
             self._check_cancel(result)
-            result.total_files += 1
             relative_path = source_path.relative_to(input_root)
             if source_path.suffix.lower() not in AUDIO_EXTENSIONS:
                 result.skipped_files += 1
                 self._emit(f"[Skip] 非音频文件，已跳过: {relative_path}")
                 continue
             destination = output_root / relative_path.with_suffix(f".{target_format.value}")
-            self._convert_path(source_path, destination, target_format, overwrite, result)
+            groups.setdefault(destination.resolve(), []).append(source_path)
+
+        def convert_group(destination: Path, sources: list[Path]) -> ConversionResult:
+            for source in sources:
+                if self.cancel_callback and self.cancel_callback():
+                    break
+                local_result = ConversionResult()
+                with self._result_lock:
+                    result.active_conversions += 1
+                    self._publish_progress(result)
+                try:
+                    self._convert_path(source, destination, target_format, overwrite, local_result)
+                except JobCancelledError:
+                    break
+                finally:
+                    with self._result_lock:
+                        result.active_conversions -= 1
+                        result.converted_files += local_result.converted_files
+                        result.skipped_files += local_result.skipped_files
+                        result.errors += local_result.errors
+                        if local_result.latest_media_path:
+                            result.latest_media_path = local_result.latest_media_path
+                            result.latest_media_dir = local_result.latest_media_dir
+                        self._publish_progress(result)
+            return result
+
+        self._emit(f"转换并发数: {self.concurrency}")
+        with ThreadPoolExecutor(max_workers=self.concurrency, thread_name_prefix="audio-conversion") as executor:
+            futures = [executor.submit(convert_group, dest, sources) for dest, sources in groups.items()]
+            for future in as_completed(futures):
+                future.result()
+        self._check_cancel(result)
 
     def _convert_path(
         self,
@@ -216,11 +273,18 @@ class ConversionService:
             self._emit(f"[Skip] 目标文件已存在: {destination}")
             return
 
+        temporary: Path | None = None
         try:
             metadata = self._read_metadata(source_path)
             destination.parent.mkdir(parents=True, exist_ok=True)
-            self._run_ffmpeg(source_path, destination, target_format, metadata.sample_rate, overwrite, result)
-            self._write_metadata(destination, target_format, metadata)
+            # FFmpeg cannot read and write the same file. Only replace the
+            # destination once both encoding and metadata writing succeed.
+            with tempfile.NamedTemporaryFile(prefix=".amd-convert-", suffix=destination.suffix,
+                                             dir=destination.parent, delete=False) as handle:
+                temporary = Path(handle.name)
+            self._run_ffmpeg(source_path, temporary, target_format, metadata.sample_rate, True, result)
+            self._write_metadata(temporary, target_format, metadata)
+            temporary.replace(destination)
             result.converted_files += 1
             result.latest_media_path = str(destination.resolve())
             result.latest_media_dir = str(destination.resolve().parent)
@@ -229,9 +293,10 @@ class ConversionService:
             raise
         except Exception as exc:
             result.errors += 1
-            self._emit(f"[Error] {source_path}: {exc}")
-            if destination.exists():
-                destination.unlink(missing_ok=True)
+            self._emit(f"[Error] {source_path}: {str(exc) or type(exc).__name__}")
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     def _run_ffmpeg(
         self,
@@ -448,6 +513,9 @@ class ConversionService:
 
         if isinstance(audio, (FLAC, OggOpus, OggVorbis)):
             for key in generic_keys:
+                # MP4 atoms (such as ©nam) are invalid Vorbis field names.
+                if not key.isascii():
+                    continue
                 value = audio.tags.get(key) if audio.tags else None
                 text = self._extract_text_value(value)
                 if text:

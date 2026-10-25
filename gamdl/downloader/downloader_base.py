@@ -49,7 +49,9 @@ class AppleMusicBaseDownloader:
         cover_size: int | None = None,
         truncate: int = None,
         silent: bool = False,
+        preserve_folder_structure: bool = True,
     ):
+        self.preserve_folder_structure = preserve_folder_structure
         self.output_path = output_path
         self.temp_path = temp_path
         self.wvd_path = wvd_path
@@ -211,6 +213,17 @@ class AppleMusicBaseDownloader:
         source_context: str | None = None,
         artist_folder_name: str | None = None,
     ) -> str:
+        has_playlist_order = bool(playlist_tags and playlist_tags.playlist_track)
+        if not getattr(self, "preserve_folder_structure", True):
+            parts = self._format_path_parts(
+                ["[{playlist_track:02d}]{title}-{album}-{artist}"
+                 if has_playlist_order else "[{track:02d}]{title}-{album}-{artist}"],
+                tags,
+                file_extension,
+                playlist_tags,
+            )
+            return str(Path(self.output_path, *parts))
+
         if source_context == "artist-top-songs":
             return self._get_artist_top_songs_final_path(
                 tags,
@@ -236,6 +249,11 @@ class AppleMusicBaseDownloader:
         else:
             template_file_parts = self.no_album_file_template.split("/")
 
+        if has_playlist_order:
+            template_file_parts = [
+                re.sub(r"\{track(?=[:!}])", "{playlist_track", part)
+                for part in template_file_parts
+            ]
         template_parts = template_folder_parts + template_file_parts
         formatted_parts = self._format_path_parts(
             template_parts,

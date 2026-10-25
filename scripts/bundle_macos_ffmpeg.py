@@ -130,7 +130,7 @@ def bundle_ffmpeg(app_path: Path, ffmpeg_source: Path) -> None:
                 if resolved is None:
                     continue
                 source = resolved
-            if str(source).startswith(SYSTEM_PREFIXES):
+            if not is_bundle_candidate(str(source)):
                 continue
             if not source.exists():
                 raise FileNotFoundError(f"缺少 ffmpeg 依赖：{source}")

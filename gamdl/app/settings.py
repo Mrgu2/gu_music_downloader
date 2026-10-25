@@ -23,11 +23,22 @@ from .wrapper_manager import (
     parse_wrapper_decrypt_ip,
 )
 
+CONCURRENCY_KEYS = {"download_concurrency", "conversion_concurrency"}
+
+
+def validate_concurrency(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 32:
+        raise ValueError("并发数必须是 1 到 32 之间的整数。")
+    return value
+
+
 ALLOWED_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
 ALLOWED_SONG_CODECS = {"aac-legacy", "aac", "alac", "atmos"}
 BOOLEAN_KEYS = {
     "overwrite",
+    "keep_original_files",
     "save_cover",
+    "preserve_folder_structure",
     "browser_import_enabled",
     "setup_completed",
     "use_wrapper",
@@ -41,6 +52,7 @@ STRING_KEYS = {
     "open_file_application",
     "proxy_url",
     "song_codec",
+    "download_output_format",
     "theme",
     "wrapper_decrypt_ip",
 }
@@ -79,6 +91,7 @@ class AppSettings:
     output_path: str
     overwrite: bool = False
     save_cover: bool = True
+    preserve_folder_structure: bool = True
     log_level: str = "INFO"
     language: str = "zh-CN"
     last_login_method: str | None = None
@@ -86,6 +99,10 @@ class AppSettings:
     browser_import_enabled: bool = True
     setup_completed: bool = False
     song_codec: str = "aac-legacy"
+    download_output_format: str = "original"
+    keep_original_files: bool = False
+    download_concurrency: int = 8
+    conversion_concurrency: int = 8
     theme: str = "warm"
     use_wrapper: bool = False
     wrapper_decrypt_ip: str = DEFAULT_WRAPPER_DECRYPT_IP
@@ -132,7 +149,12 @@ class AppSettingsStore:
     def _sanitize(self, payload: dict[str, Any]) -> dict[str, Any]:
         sanitized: dict[str, Any] = {}
         for key, value in payload.items():
-            if key in BOOLEAN_KEYS and isinstance(value, bool):
+            if key in CONCURRENCY_KEYS:
+                try:
+                    sanitized[key] = validate_concurrency(value)
+                except ValueError:
+                    pass
+            elif key in BOOLEAN_KEYS and isinstance(value, bool):
                 sanitized[key] = value
             elif key in STRING_KEYS and isinstance(value, str):
                 stripped = value.strip()
@@ -143,6 +165,8 @@ class AppSettingsStore:
             sanitized.pop("log_level")
         if "song_codec" in sanitized and sanitized["song_codec"] not in ALLOWED_SONG_CODECS:
             sanitized.pop("song_codec")
+        if "download_output_format" in sanitized and sanitized["download_output_format"] not in {"original", "flac", "mp3"}:
+            sanitized.pop("download_output_format")
         if "theme" in sanitized and sanitized["theme"] not in ALLOWED_THEMES:
             sanitized.pop("theme")
         if "language" in sanitized:
@@ -205,6 +229,10 @@ class AppSettingsStore:
         return AppSettings(**payload)
 
     def save(self, payload: dict[str, Any]) -> AppSettings:
+        for key in CONCURRENCY_KEYS & payload.keys():
+            validate_concurrency(payload[key])
+        if "download_output_format" in payload and payload["download_output_format"] not in {"original", "flac", "mp3"}:
+            raise ValueError("下载后格式请选择保留原格式、FLAC 或 MP3。")
         if "network_mode" in payload or "proxy_url" in payload:
             current = self.load()
             try:

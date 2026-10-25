@@ -55,7 +55,6 @@ from .downloader.constants import VALID_URL_PATTERN
 
 logger = logging.getLogger("gamdl.app.web")
 
-MAX_LOG_LINES = 4000
 MAX_JSON_BODY_BYTES = 1024 * 1024
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -195,12 +194,17 @@ def build_download_command(payload: dict[str, Any]) -> list[str]:
         "output_path",
         "overwrite",
         "save_cover",
+        "preserve_folder_structure",
         "save_playlist",
         "log_level",
         "language",
         "network_mode",
         "proxy_url",
         "song_codec",
+        "download_output_format",
+        "keep_original_files",
+        "download_concurrency",
+        "conversion_concurrency",
         "artist_auto_select",
         "use_wrapper",
         "wrapper_decrypt_ip",
@@ -250,8 +254,6 @@ class Job:
     def append_log(self, line: str) -> None:
         if line:
             self.logs.append(line)
-            if len(self.logs) > MAX_LOG_LINES:
-                self.logs = self.logs[-MAX_LOG_LINES:]
 
     def request_cancel(self) -> bool:
         if self._cancel_event.is_set():
@@ -297,14 +299,19 @@ class JobManager:
         self.jobs: dict[str, Job] = {}
         self.jobs_lock = threading.Lock()
         self.job_queue: queue.Queue[str] = queue.Queue()
+        self.conversion_queue: queue.Queue[str] = queue.Queue()
         self._shutdown = False
         self.worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self.conversion_worker = threading.Thread(target=self._worker_loop, args=(True,), daemon=True)
         self.worker.start()
+        self.conversion_worker.start()
 
     def shutdown(self, timeout: float = 1.0) -> None:
         self._shutdown = True
         self.job_queue.put("")
+        self.conversion_queue.put("")
         self.worker.join(timeout=timeout)
+        self.conversion_worker.join(timeout=timeout)
 
     def create_job(self, payload: dict[str, Any]) -> Job:
         kind = str(payload.get("kind") or "download").strip().lower()
@@ -407,7 +414,7 @@ class JobManager:
         )
         with self.jobs_lock:
             self.jobs[job.id] = job
-        self.job_queue.put(job.id)
+        self.conversion_queue.put(job.id)
         return job
 
     def get_job(self, job_id: str) -> Job | None:
@@ -434,9 +441,10 @@ class JobManager:
             job.append_log("已收到取消请求，取消中，当前文件完成后停止。")
         return True
 
-    def _worker_loop(self) -> None:
+    def _worker_loop(self, conversion: bool = False) -> None:
         while True:
-            job_id = self.job_queue.get()
+            job_queue = self.conversion_queue if conversion else self.job_queue
+            job_id = job_queue.get()
             try:
                 if self._shutdown:
                     return
@@ -445,7 +453,7 @@ class JobManager:
                     continue
                 self._run_job(job)
             finally:
-                self.job_queue.task_done()
+                job_queue.task_done()
 
     def _run_job(self, job: Job) -> None:
         job.status = "running"
@@ -499,6 +507,7 @@ class JobManager:
             log_callback=job.append_log,
             cancel_callback=job.is_cancel_requested,
             paths=self.paths,
+            progress_callback=lambda result: setattr(job, "result", result),
         )
         try:
             result = service.run_sync(
@@ -507,6 +516,11 @@ class JobManager:
                     output_path=job.payload["output_path"],
                     overwrite=job.payload["overwrite"],
                     save_cover=job.payload["save_cover"],
+                    download_output_format=job.payload.get("download_output_format", "original"),
+                    keep_original_files=job.payload.get("keep_original_files", False),
+                    download_concurrency=job.payload.get("download_concurrency", 8),
+                    conversion_concurrency=job.payload.get("conversion_concurrency", 8),
+                    preserve_folder_structure=job.payload.get("preserve_folder_structure", True),
                     save_playlist=bool(job.payload.get("save_playlist")),
                     log_level=job.payload["log_level"],
                     language=job.payload.get("language", "zh-CN"),
@@ -536,8 +550,10 @@ class JobManager:
 
     def _run_conversion_job(self, job: Job) -> None:
         service = ConversionService(
+            concurrency=job.payload.get("conversion_concurrency", 8),
             log_callback=job.append_log,
             cancel_callback=job.is_cancel_requested,
+            progress_callback=lambda result: setattr(job, "result", result),
         )
         result = service.run(
             ConversionJobSpec(
@@ -1733,6 +1749,27 @@ INDEX_HTML = """<!doctype html>
     .field {
       display: grid;
       gap: 8px;
+    }
+    #page-settings .grid.two {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      align-items: start;
+    }
+    #page-settings .field {
+      min-width: 0;
+      align-content: start;
+    }
+    #page-settings select {
+      height: 48px;
+      padding-top: 0;
+      padding-bottom: 0;
+      text-overflow: ellipsis;
+    }
+    #page-settings .field > .muted {
+      line-height: 1.6;
+      font-size: 12px;
+    }
+    @media (max-width: 900px) {
+      #page-settings .grid.two { grid-template-columns: 1fr; }
     }
     .field label {
       font-size: 13px;
@@ -3135,13 +3172,43 @@ INDEX_HTML = """<!doctype html>
                 </select>
               </div>
               <div class="field">
-                <label for="save-cover">封面文件</label>
-                <select id="save-cover">
-                  <option value="true">保存</option>
-                  <option value="false">不保存</option>
+                <label for="folder-structure">下载文件夹结构</label>
+                <select id="folder-structure">
+                  <option value="true">保留文件夹结构（默认）</option>
+                  <option value="false">舍弃文件夹结构（所有歌曲放在同一文件夹）</option>
+                </select>
+                <div class="muted">舍弃结构时使用“[歌曲序号]歌名-专辑名-歌手”命名（歌单使用歌单顺序，专辑使用专辑曲序，不足两位补零）；仅影响新任务，同名文件按覆盖设置处理。</div>
+              </div>
+            </div>
+            <div class="grid two">
+              <div class="field">
+                <label for="download-output-format">下载后格式</label>
+                <select id="download-output-format">
+                  <option value="original">保留原格式</option>
+                  <option value="flac">转换成 FLAC</option>
+                  <option value="mp3">转换成 MP3</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="keep-original-files">转换后保留原文件</label>
+                <select id="keep-original-files">
+                  <option value="false">否，仅保留转换后的文件</option>
+                  <option value="true">是，同时保留原文件</option>
                 </select>
               </div>
             </div>
+            <div class="muted">转换参数与转换菜单一致。保留原文件选项仅在转换格式时生效；转换失败时保留原文件，已有原文件不删除。</div>
+            <div class="grid two">
+              <div class="field">
+                <label for="download-concurrency">下载并发数</label>
+                <input id="download-concurrency" type="number" min="1" max="32" step="1" value="8" />
+              </div>
+              <div class="field">
+                <label for="conversion-concurrency">转换并发数</label>
+                <input id="conversion-concurrency" type="number" min="1" max="32" step="1" value="8" />
+              </div>
+            </div>
+            <div class="muted">并发数可设为 1–32，默认 8；仅影响新任务。转换并发数同时用于下载后转换和转换菜单。</div>
             <div class="grid two">
               <div class="field">
                 <label for="song-codec">音质</label>
@@ -3175,6 +3242,13 @@ INDEX_HTML = """<!doctype html>
                 <select id="theme-select">
                   <option value="warm">暖色</option>
                   <option value="cool">白蓝灰</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="save-cover">封面文件</label>
+                <select id="save-cover">
+                  <option value="true">保存</option>
+                  <option value="false">不保存</option>
                 </select>
               </div>
             </div>
@@ -3452,6 +3526,11 @@ docker stop wrapper-latest-10022</pre>
       document.querySelectorAll('.page').forEach((node) => node.classList.remove('active'));
       document.getElementById(`page-${page}`).classList.add('active');
       document.getElementById('page-title').textContent = state.pages[page];
+      if (page === 'jobs') {
+        document.querySelectorAll('.job-log-scroll').forEach((panel) => {
+          panel.scrollTop = panel._followLogs !== false ? panel.scrollHeight : (panel._savedScrollTop || 0);
+        });
+      }
     }
 
     function syncSetupOverlay() {
@@ -3776,6 +3855,37 @@ docker stop wrapper-latest-10022</pre>
       `).join('');
     }
 
+    function updateJobLog(panel, lines) {
+      const output = panel.querySelector('pre');
+      const previous = panel._logLines || [];
+      const firstRender = !panel._logLines;
+      const follow = firstRender || (panel.offsetParent === null
+        ? panel._followLogs !== false
+        : panel.scrollHeight - panel.clientHeight - panel.scrollTop <= 8);
+      if (firstRender) {
+        panel.addEventListener('scroll', () => {
+          if (panel.offsetParent !== null) {
+            panel._followLogs = panel.scrollHeight - panel.clientHeight - panel.scrollTop <= 8;
+            panel._savedScrollTop = panel.scrollTop;
+          }
+        }, { passive: true });
+      }
+      const top = panel.offsetParent === null ? (panel._savedScrollTop || 0) : panel.scrollTop;
+      const next = Array.isArray(lines) ? lines : [];
+      const unchanged = previous.length === next.length && previous.every((line, i) => line === next[i]);
+      if (!firstRender && unchanged) return;
+      const appended = previous.length <= next.length && previous.every((line, i) => line === next[i]);
+      if (appended && previous.length) {
+        output.appendChild(document.createTextNode('\\n' + next.slice(previous.length).join('\\n')));
+      } else {
+        output.textContent = next.join('\\n') || '暂无日志';
+      }
+      panel._logLines = next.slice();
+      panel._followLogs = follow;
+      panel.scrollTop = follow ? panel.scrollHeight : top;
+      if (panel.offsetParent !== null) panel._savedScrollTop = panel.scrollTop;
+    }
+
     function renderJobs(jobs) {
       state.jobs = jobs;
       const activeJobIds = new Set(jobs.map((job) => job.id));
@@ -3801,7 +3911,7 @@ docker stop wrapper-latest-10022</pre>
         return;
       }
 
-      list.innerHTML = jobs.map((job) => {
+      const cardsHtml = jobs.map((job) => {
         const [statusLabel, statusClass] = badgeForStatus(job);
         const result = job.result || {};
         const isConvert = job.kind === 'convert';
@@ -3843,16 +3953,36 @@ docker stop wrapper-latest-10022</pre>
           : `<div class="muted">${job.urls.map((url) => escapeHtml(url)).join('<br>')}</div>`;
         const summaryBadges = isConvert
           ? `
+              <span class="badge">处理中 ${result.active_conversions || 0}/${result.conversion_concurrency || job.payload?.conversion_concurrency || 8}</span>
               <span class="badge">成功 ${result.converted_files || 0}</span>
               <span class="badge">跳过 ${result.skipped_files || 0}</span>
               <span class="badge">文件 ${result.total_files || 0}</span>
               <span class="badge ${job.error_message ? 'danger' : ''}">错误 ${errorCount}</span>
             `
           : `
+              <span class="badge">处理中 ${result.active_downloads || 0}/${result.download_concurrency || job.payload?.download_concurrency || 8}</span>
               <span class="badge">成功 ${result.downloaded_items || 0}</span>
               <span class="badge">跳过 ${result.skipped_items || 0}</span>
               <span class="badge ${job.error_message ? 'danger' : ''}">错误 ${errorCount}</span>
             `;
+        const outputFormat = job.payload?.download_output_format || 'original';
+        const downloadDone = (result.downloaded_items || 0) + (result.skipped_items || 0)
+          + Math.max(0, (result.errors || 0) - (result.conversion_errors || 0));
+        const conversionDone = (result.converted_items || 0) + (result.conversion_skipped || 0)
+          + (result.conversion_errors || 0);
+        const stageProgress = isConvert
+          ? `<div class="muted">转换：已完成 ${(result.converted_files || 0) + (result.skipped_files || 0) + (result.errors || 0)} / ${result.total_files || 0}</div>
+             <progress style="width:100%" value="${(result.converted_files || 0) + (result.skipped_files || 0) + (result.errors || 0)}" max="${Math.max(1, result.total_files || 0)}"></progress>`
+          : `<div class="muted">歌曲信息准备：${result.prepared_items || 0} / ${result.preparation_total || 0}</div>
+             <progress style="width:100%" value="${result.prepared_items || 0}" max="${Math.max(1, result.preparation_total || 0)}"></progress>
+             <div class="muted">下载：已处理 ${downloadDone} / ${result.total_items || 0}，同时处理 ${result.active_downloads || 0}/${result.download_concurrency || job.payload?.download_concurrency || 8} 首</div>
+             <progress style="width:100%" value="${downloadDone}" max="${Math.max(1, result.total_items || 0)}"></progress>
+             <div class="muted">正在下载：${escapeHtml((result.downloading_titles || []).join(' / ') || '无')}</div>
+             ${outputFormat !== 'original' ? `
+               <div class="muted">${escapeHtml(outputFormat.toUpperCase())} 转换：成功 ${result.converted_items || 0}，跳过 ${result.conversion_skipped || 0}，失败 ${result.conversion_errors || 0}，待转换 ${Math.max(0, (result.conversion_total || 0) - conversionDone - (result.active_conversions || 0))}，同时处理 ${result.active_conversions || 0}/${result.conversion_concurrency || job.payload?.conversion_concurrency || 8} 首</div>
+               <progress style="width:100%" value="${conversionDone}" max="${Math.max(1, result.total_items || 0, result.conversion_total || 0)}"></progress>
+               <div class="muted">正在转换：${escapeHtml((result.converting_titles || []).join(' / ') || '无')}</div>
+             ` : '<div class="muted">下载后保留原格式</div>'}`;
         const fileActions = canShowOutputAction
           ? `
             <div class="inline">
@@ -3867,7 +3997,8 @@ docker stop wrapper-latest-10022</pre>
           `
           : '';
         return `
-          <div class="list-item">
+          <div class="list-item" data-job-card="${escapeHtml(job.id)}">
+            <div class="job-details">
             <div class="list-head">
               ${primaryMeta}
               <span class="${statusClass}">${statusLabel}</span>
@@ -3881,14 +4012,34 @@ docker stop wrapper-latest-10022</pre>
               ${actions}
               ${retryActions}
             </div>
+            ${stageProgress}
             ${failedSummary}
             ${fileActions}
+            </div>
             <div class="log-scroll-panel job-log-scroll">
-              <pre>${escapeHtml((job.logs || []).slice(-10).join('\\n') || '暂无日志')}</pre>
+              <pre></pre>
             </div>
           </div>
         `;
       }).join('');
+      const template = document.createElement('template');
+      template.innerHTML = cardsHtml;
+      const existing = new Map(Array.from(list.children).map((card) => [card.dataset.jobCard, card]));
+      const jobById = new Map(jobs.map((job) => [job.id, job]));
+      Array.from(list.children).forEach((card) => {
+        if (!jobById.has(card.dataset.jobCard)) card.remove();
+      });
+      Array.from(template.content.children).forEach((incoming, index) => {
+        const id = incoming.dataset.jobCard;
+        const card = existing.get(id) || incoming;
+        if (card !== incoming) {
+          const details = card.querySelector('.job-details');
+          const nextDetails = incoming.querySelector('.job-details');
+          if (details.innerHTML !== nextDetails.innerHTML) details.innerHTML = nextDetails.innerHTML;
+        }
+        if (list.children[index] !== card) list.insertBefore(card, list.children[index] || null);
+        updateJobLog(card.querySelector('.job-log-scroll'), jobById.get(id).logs);
+      });
     }
 
     function renderCompactJobs(jobs) {
@@ -4109,8 +4260,13 @@ docker stop wrapper-latest-10022</pre>
       document.getElementById('output-path').value = settings.output_path || '';
       document.getElementById('setup-output-path').value = settings.output_path || '';
       document.getElementById('log-level').value = settings.log_level || 'INFO';
+      document.getElementById('folder-structure').value = String(settings.preserve_folder_structure !== false);
       document.getElementById('save-cover').value = String(settings.save_cover);
       document.getElementById('song-codec').value = settings.song_codec || 'aac-legacy';
+      document.getElementById('download-output-format').value = settings.download_output_format || 'original';
+      document.getElementById('keep-original-files').value = String(settings.keep_original_files === true);
+      document.getElementById('download-concurrency').value = settings.download_concurrency || 8;
+      document.getElementById('conversion-concurrency').value = settings.conversion_concurrency || 8;
       setMetadataLanguageValue(settings.language || 'zh-CN');
       document.getElementById('theme-select').value = settings.theme || 'warm';
       document.getElementById('overwrite').value = String(settings.overwrite);
@@ -4186,14 +4342,21 @@ docker stop wrapper-latest-10022</pre>
       renderSettings(data.settings, data.wrapper_status, data.runtime);
     }
 
+    let jobsRefreshInFlight = false;
     async function refreshJobs(options = {}) {
       const shouldPreserveOpenMenu = Boolean(options.preserveOpenMenu);
       if (shouldPreserveOpenMenu && state.openWithMenuJobId) {
         return;
       }
-      closeOpenWithMenus();
-      const data = await api('/api/jobs');
-      renderJobs(data.jobs);
+      if (jobsRefreshInFlight) return;
+      jobsRefreshInFlight = true;
+      try {
+        closeOpenWithMenus();
+        const data = await api('/api/jobs');
+        renderJobs(data.jobs);
+      } finally {
+        jobsRefreshInFlight = false;
+      }
     }
 
     async function refreshLogs() {
@@ -4437,8 +4600,13 @@ docker stop wrapper-latest-10022</pre>
       return {
         output_path: document.getElementById('output-path').value.trim(),
         log_level: document.getElementById('log-level').value,
+        preserve_folder_structure: document.getElementById('folder-structure').value === 'true',
         save_cover: document.getElementById('save-cover').value === 'true',
         song_codec: document.getElementById('song-codec').value,
+        download_output_format: document.getElementById('download-output-format').value,
+        keep_original_files: document.getElementById('keep-original-files').value === 'true',
+        download_concurrency: Number(document.getElementById('download-concurrency').value),
+        conversion_concurrency: Number(document.getElementById('conversion-concurrency').value),
         language: readMetadataLanguageValue(),
         artist_auto_select: document.getElementById('artist-auto-select').value,
         theme: document.getElementById('theme-select').value,

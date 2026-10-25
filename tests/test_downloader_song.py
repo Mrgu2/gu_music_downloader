@@ -231,7 +231,7 @@ class AppleMusicSongDownloaderTests(unittest.TestCase):
             )
             self.assertEqual(
                 Path(download_item.cover_path),
-                Path(tempdir) / "downloads" / "Artist A" / "Top Songs" / "Track Title [12345].jpg",
+                Path(tempdir) / "downloads" / "Artist A" / "Top Songs" / "cover-Album.jpg",
             )
 
     def test_get_download_item_uses_library_webplayback_and_drm_free_stream(self):
@@ -326,7 +326,7 @@ class AppleMusicSongDownloaderTests(unittest.TestCase):
 
             self.assertEqual(
                 Path(cover_path),
-                Path(tempdir) / "downloads" / "Artist" / "Top Songs" / "Track Title [12345].jpg",
+                Path(tempdir) / "downloads" / "Artist" / "Top Songs" / "cover-Unknown Album.jpg",
             )
 
     def test_get_cover_path_keeps_shared_cover_outside_top_songs(self):
@@ -345,7 +345,7 @@ class AppleMusicSongDownloaderTests(unittest.TestCase):
 
             self.assertEqual(
                 Path(cover_path),
-                Path(tempdir) / "downloads" / "Artist" / "Album" / "Cover.jpg",
+                Path(tempdir) / "downloads" / "Artist" / "Album" / "cover-Unknown Album.jpg",
             )
 
     def test_single_download_item_captures_format_not_available_error(self):

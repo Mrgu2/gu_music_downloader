@@ -23,6 +23,45 @@ class AppleMusicBaseDownloaderTests(unittest.TestCase):
         downloader.truncate = None
         return downloader
 
+    def test_flat_paths_cover_album_compilation_and_artist_top_songs(self):
+        downloader = self._base_downloader_stub()
+        downloader.preserve_folder_structure = False
+        for context in (None, "artist-top-songs"):
+            for compilation in (False, True):
+                tags = MediaTags(artist="Singer", title="Song", title_id=123,
+                                 album="Album", track=1, compilation=compilation, disc_total=2)
+                self.assertEqual(
+                    downloader.get_final_path(tags, ".m4a", None,
+                                              source_context=context,
+                                              artist_folder_name="Singer"),
+                    "/tmp/out/[01]Song-Album-Singer.m4a",
+                )
+
+    def test_playlist_filename_uses_playlist_position_without_changing_album_tag(self):
+        downloader = self._base_downloader_stub()
+        tags = MediaTags(artist="Singer", album_artist="Singer", title="Song",
+                         album="Album", track=3, disc_total=1)
+        playlist = PlaylistTags(playlist_track=12)
+        for preserve, expected in (
+            (False, "/tmp/out/[12]Song-Album-Singer.m4a"),
+            (True, "/tmp/out/Singer/Album/12 Song.m4a"),
+        ):
+            downloader.preserve_folder_structure = preserve
+            self.assertEqual(downloader.get_final_path(tags, ".m4a", playlist), expected)
+            self.assertEqual(tags.track, 3)
+        downloader.preserve_folder_structure = False
+        playlist.playlist_track = 105
+        self.assertIn("[105]", downloader.get_final_path(tags, ".m4a", playlist))
+
+    def test_flat_paths_distinguish_albums_and_sanitize_slashes(self):
+        downloader = self._base_downloader_stub()
+        downloader.preserve_folder_structure = False
+        paths = [Path(downloader.get_final_path(
+            MediaTags(artist="A/B", title="Same/Title", album=album),
+            ".m4a", None)) for album in ("Album One", "Album Two")]
+        self.assertNotEqual(paths[0], paths[1])
+        self.assertTrue(all(path.parent == Path("/tmp/out") for path in paths))
+
     def test_output_path_default_is_machine_neutral(self):
         self.assertEqual(
             AppleMusicBaseDownloader.__init__.__defaults__[0],

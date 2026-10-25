@@ -19,6 +19,7 @@ FFMPEG_COMMAND = shutil.which("ffmpeg")
 class ConversionServiceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.service = ConversionService()
+        self.service.full_ffmpeg_path = FFMPEG_COMMAND
 
     def _create_sample_m4a(
         self,

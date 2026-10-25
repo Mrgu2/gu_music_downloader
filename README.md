@@ -185,16 +185,6 @@ dist/*-arm64.dmg
 dist/*-x86_64.dmg
 ```
 
-### 本地更新时保留现有图标（macOS）
-
-已安装应用时，可使用以下脚本先备份旧应用、构建当前源码，再保留原有应用图标及 Finder 自定义图标进行替换安装：
-
-```bash
-bash scripts/install-local-preserve-icon.sh
-```
-
-脚本会在安装前检查应用是否仍在运行，并校验新应用签名。
-
 ### Windows 构建
 
 如果你是在 Windows 本地构建，可参考：

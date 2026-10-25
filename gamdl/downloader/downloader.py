@@ -8,6 +8,7 @@ from InquirerPy.base.control import Choice
 
 from ..api.exceptions import ApiError
 from ..interface import AppleMusicInterface
+from ..interface.types import PlaylistTags
 from ..utils import safe_gather
 from .constants import (
     ALBUM_MEDIA_TYPE,
@@ -65,6 +66,7 @@ class AppleMusicDownloader:
         playlist_metadata: dict = None,
         source_context: str | None = None,
         artist_folder_name: str | None = None,
+        playlist_tags_override: PlaylistTags | None = None,
     ) -> DownloadItem:
         if self.flat_filter:
             flat_filter_result = self.flat_filter(media_metadata)
@@ -78,6 +80,7 @@ class AppleMusicDownloader:
                     source_context=source_context,
                     artist_folder_name=artist_folder_name,
                     flat_filter_result=flat_filter_result,
+                    playlist_tags=playlist_tags_override,
                 )
 
         return await self.get_single_download_item_no_filter(
@@ -85,6 +88,7 @@ class AppleMusicDownloader:
             playlist_metadata,
             source_context,
             artist_folder_name,
+            **({"playlist_tags_override": playlist_tags_override} if playlist_tags_override else {}),
         )
 
     async def get_single_download_item_no_filter(
@@ -93,6 +97,7 @@ class AppleMusicDownloader:
         playlist_metadata: dict = None,
         source_context: str | None = None,
         artist_folder_name: str | None = None,
+        playlist_tags_override: PlaylistTags | None = None,
     ) -> DownloadItem:
         try:
             if not self.base_downloader.is_media_streamable(
@@ -109,6 +114,7 @@ class AppleMusicDownloader:
                     playlist_metadata,
                     source_context=source_context,
                     artist_folder_name=artist_folder_name,
+                    **({"playlist_tags_override": playlist_tags_override} if playlist_tags_override else {}),
                 )
 
             if media_metadata["type"] in MUSIC_VIDEO_MEDIA_TYPE:
@@ -134,6 +140,7 @@ class AppleMusicDownloader:
                 source_context=source_context,
                 artist_folder_name=artist_folder_name,
                 error=e,
+                playlist_tags=playlist_tags_override,
             )
 
         return download_item
@@ -371,6 +378,105 @@ class AppleMusicDownloader:
             **match.groupdict(),
         )
 
+    async def iter_prepared_download_items(
+        self,
+        url_info: UrlInfo,
+        *,
+        preparation_concurrency: int = 8,
+        cancel_callback: typing.Callable[[], bool] | None = None,
+    ) -> typing.AsyncIterator[tuple[int, int, DownloadItem | None]]:
+        """Yield (original position, collection size, item) as each item is ready.
+
+        Position zero announces the total before expensive per-song preparation.
+        A bounded queue prevents slow downloads from creating an unbounded backlog.
+        """
+        if not 1 <= preparation_concurrency <= 32:
+            raise ValueError("歌曲信息准备并发数必须在 1 到 32 之间。")
+        kind = "song" if url_info.sub_id else url_info.type or url_info.library_type
+        if kind not in ALBUM_MEDIA_TYPE | PLAYLIST_MEDIA_TYPE:
+            items = await self.get_download_queue(url_info) or []
+            yield 0, len(items), None
+            for index, item in enumerate(items, 1):
+                if cancel_callback and cancel_callback():
+                    return
+                yield index, len(items), item
+            return
+
+        media_id = url_info.sub_id or url_info.id or url_info.library_id
+        api = self.interface.apple_music_api
+        is_library = url_info.library_id is not None
+        if kind in PLAYLIST_MEDIA_TYPE:
+            fetch = api.get_library_playlist if is_library else api.get_playlist
+        else:
+            fetch = api.get_library_album if is_library else api.get_album
+        try:
+            response = await fetch(media_id)
+        except ApiError as exc:
+            if exc.status_code == 404:
+                yield 0, 0, None
+                return
+            raise
+        if not response or not response.get("data"):
+            yield 0, 0, None
+            return
+        collection = response["data"][0]
+        tracks = collection["relationships"]["tracks"]["data"]
+        async for page in api.extend_api_data(collection["relationships"]["tracks"]):
+            if cancel_callback and cancel_callback():
+                return
+            tracks.extend(page["data"])
+        total = len(tracks)
+        yield 0, total, None
+        if not total:
+            return
+        pending = iter(enumerate(tracks, 1))
+        ready = asyncio.Queue(maxsize=max(1, preparation_concurrency))
+        is_playlist = kind in PLAYLIST_MEDIA_TYPE
+
+        async def prepare_worker():
+            cancelled = False
+            try:
+                for index, metadata in pending:
+                    if cancel_callback and cancel_callback():
+                        break
+                    playlist_tags = None
+                    try:
+                        if is_playlist and metadata["type"] in SONG_MEDIA_TYPE:
+                            playlist_tags = self.base_downloader.get_playlist_tags(collection, metadata)
+                            # Preserve position even for duplicate songs and out-of-order completion.
+                            playlist_tags.playlist_track = index
+                        item = await self.get_single_download_item(
+                            metadata, collection if is_playlist else None,
+                            **({"playlist_tags_override": playlist_tags} if playlist_tags else {}),
+                        )
+                    except Exception as exc:
+                        item = DownloadItem(media_metadata=metadata,
+                            playlist_metadata=collection if is_playlist else None,
+                            playlist_tags=playlist_tags, error=exc)
+                    await ready.put((index, total, item))
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            finally:
+                if not cancelled:
+                    await ready.put(None)
+
+        workers = [asyncio.create_task(prepare_worker())
+                   for _ in range(min(preparation_concurrency, total))]
+        finished = 0
+        try:
+            while finished < len(workers):
+                value = await ready.get()
+                if value is None:
+                    finished += 1
+                else:
+                    yield value
+        finally:
+            for worker in workers:
+                if not worker.done():
+                    worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+
     async def get_download_queue(
         self,
         url_info: UrlInfo,
@@ -518,6 +624,8 @@ class AppleMusicDownloader:
                     download_item.playlist_metadata,
                     download_item.source_context,
                     download_item.artist_folder_name,
+                    **({"playlist_tags_override": download_item.playlist_tags}
+                       if download_item.playlist_tags else {}),
                 )
 
             if download_item.error:
@@ -635,10 +743,7 @@ class AppleMusicDownloader:
         ):
             try:
                 cover_bytes = await self.interface.get_cover_bytes(download_item.cover_url)
-                if cover_bytes and (
-                    self.base_downloader.overwrite
-                    or not Path(download_item.cover_path).exists()
-                ):
+                if cover_bytes:
                     self.base_downloader.write_cover_image(
                         cover_bytes,
                         download_item.cover_path,
